@@ -24,6 +24,10 @@ from models import model_definition
 
 global_var_asr_count = 1
 
+from nltk.corpus import stopwords
+from nltk.stem.wordnet import WordNetLemmatizer
+
+from model import Delex_Model
 
 lp = {}
 lp["english"] = "en"
@@ -405,7 +409,7 @@ def process_turn_hyp(transcription, language):
     return transcription
 
 
-def process_woz_dialogue(woz_dialogue,language,override_en_ontology, num_informable_pairs):
+def process_woz_dialogue(woz_dialogue,language,override_en_ontology, num_informable_pairs, restaurant_db):
     """
     Returns a list of (tuple, belief_state) for each turn in the dialogue.
     """
@@ -453,6 +457,11 @@ def process_woz_dialogue(woz_dialogue,language,override_en_ontology, num_informa
 
     slots_mentioned = 0
 
+    offered = False
+    #these are accumulating after an offer is made
+    system_requests = []
+    user_requests = []
+
     for idx, turn in enumerate(woz_dialogue):
 
         current_DA = turn["system_acts"]
@@ -461,6 +470,15 @@ def process_woz_dialogue(woz_dialogue,language,override_en_ontology, num_informa
         current_conf_slot = []
         current_conf_value = []
 
+        current_system_transcript = turn["system_transcript"]
+        current_system_transcript = process_turn_hyp(current_system_transcript, language)
+
+        if not offered:
+            for r in restaurant_db:
+                if r in current_system_transcript:
+                    offered = True
+                    break
+#GOALS looks the same as TURN requests
         for each_da in current_DA:
             if each_da in informable_slots:
                 #if type(each_da) is list:
@@ -469,6 +487,12 @@ def process_woz_dialogue(woz_dialogue,language,override_en_ontology, num_informa
             elif each_da in pure_requestables:
                 current_conf_slot.append("request")
                 current_conf_value.append(each_da)
+
+                #if offered: keep adding system requests. During training, evaluate if system requests are supersets of dialog goal  
+                #logic is - I have offered you a restaurant and now I am confirming if you need some of these "address", "phone", "postcode" as per goal
+                if offered:
+                    system_requests.append(each_da)
+
             else:
                 #tf.print ("LEFTOVER: ", each_da) 
                 if type(each_da) is list:
@@ -485,9 +509,6 @@ def process_woz_dialogue(woz_dialogue,language,override_en_ontology, num_informa
         current_transcription = turn["transcript"]
         current_transcription = process_turn_hyp(current_transcription, language)
         
-        current_system_transcript = turn["system_transcript"]
-        current_system_transcript = process_turn_hyp(current_system_transcript, language)
-
         read_asr = turn["asr"]
 
         current_asr = []
@@ -523,6 +544,10 @@ def process_woz_dialogue(woz_dialogue,language,override_en_ontology, num_informa
 
             elif c_slot == "request":
                 current_bs["request"].append(c_value)
+
+                if c_value in pure_requestables:
+                  #keep adding user requests as goal. At final turn, I consider the goal of the dialog
+                  user_requests.append(c_value)
 
             slots_mentioned += 1
 
@@ -570,7 +595,7 @@ def process_woz_dialogue(woz_dialogue,language,override_en_ontology, num_informa
             else:
                 current_information_richness.append(0)
 
-        dialogue_representation.append(((current_transcription, current_asr), current_req, current_conf_slot, current_conf_value, deepcopy(current_bs), deepcopy(prev_belief_state), current_system_transcript, current_information_richness))
+        dialogue_representation.append(((current_transcription, current_asr), current_req, current_conf_slot, current_conf_value, deepcopy(current_bs), deepcopy(prev_belief_state), current_system_transcript, current_information_richness, offered, list(set(system_requests)), list(set(user_requests))))
 
         #print "====", current_transcription, "current bs", current_bs, "past bs", prev_belief_state, "this turn update", curr_lab_dict
 
@@ -579,7 +604,7 @@ def process_woz_dialogue(woz_dialogue,language,override_en_ontology, num_informa
     return dialogue_representation
 
 
-def load_woz_data(file_path, language, percentage=1.0,override_en_ontology=False, num_informable_pairs=102):
+def load_woz_data(file_path, language, num_informable_pairs, restaurant_db, percentage=1.0,override_en_ontology=False):
     """
     This method loads WOZ dataset as a collection of utterances. 
 
@@ -601,8 +626,11 @@ def load_woz_data(file_path, language, percentage=1.0,override_en_ontology=False
 
     for idx in range(0, dialogue_count):
         
-        current_dialogue = process_woz_dialogue(woz_json[idx]["dialogue"], language, override_en_ontology, num_informable_pairs)
+        current_dialogue = process_woz_dialogue(woz_json[idx]["dialogue"], language, override_en_ontology, num_informable_pairs, restaurant_db)
         dialogues.append(current_dialogue)
+
+        #these are all user requests - take it from last turn in the dialog. Woz doesn't have an explicit dialog goals in the dataset 
+        requestables_goal = current_dialogue[len(current_dialogue)-1][10]
 
         for turn_idx, turn in enumerate(current_dialogue):
 
@@ -626,7 +654,7 @@ def load_woz_data(file_path, language, percentage=1.0,override_en_ontology=False
 #                        print "!!!!!", inf_slot, turn[5][inf_slot]
 
             transcription_and_asr = turn[0]
-            current_utterance = (transcription_and_asr, turn[1], turn[2], turn[3], current_label, turn[5], turn[6], turn[7]) #turn [5] is the past belief state, turn[6] system transcript for language model, turn[7] - information richness
+            current_utterance = (transcription_and_asr, turn[1], turn[2], turn[3], current_label, turn[5], turn[6], turn[7], turn[8], turn[9], requestables_goal) #turn [5] is the past belief state, turn[6] system transcript for language model, turn[7] - information richness
 
             #tf.print ("current bs vs current label: ", turn[4], current_label)
             #print "$$$$", current_utterance
@@ -867,7 +895,7 @@ def generate_data(utterances, word_vectors, dialogue_ontology):
 
         #positive_examples[slot] = set(positive_examples[slot])
         #negative_examples[slot] = set(negative_examples[slot])
-
+        
     return feature_vectors, positive_examples, negative_examples
 
 
@@ -931,15 +959,27 @@ def generate_npa_examples(feature_vectors, word_vectors, dialogue_ontology,
     features_delex = []
     features_target = []
     features_information_richness = []
+    features_sentenceGroup = []
+    features_offered = []
+    features_requests = []
+    features_goals = []
+
+    utterances_batch = []
+
+    word_vector_size = random.choice(list(word_vectors.values())).shape[0]
 
     # now go through all examples (positive followed by negative).
     #for idx_example, example in enumerate(examples):
+    i = 0
     for utterance_idx in positive_indices:
 
         #(utterance_idx, utterance, value_idx) = example
         #utterance_fv = feature_vectors[utterance_idx]
         
         utterance = utterances_train[utterance_idx]
+        utterances_batch.append(utterance)
+        #tf.print(i, utterance[0][0])
+        i += 1
         utterance_fv = feature_vectors[utterance_idx]
 
         # for now, we just deal with the utterance, and not with WOZ data. 
@@ -956,18 +996,72 @@ def generate_npa_examples(feature_vectors, word_vectors, dialogue_ontology,
         features_delex.append(delex_features)
         features_target.append(utterance_fv[5])
         features_information_richness.append(utterance_fv[6])
+        features_sentenceGroup.append(utterance_fv[7])
+        features_offered.append(utterance_fv[8])
+        features_requests.append(utterance_fv[9])
+        features_goals.append(utterance_fv[10])
 
     features_requested_slots = numpy.array(features_requested_slots)
     features_confirm_slots = numpy.array(features_confirm_slots)
     features_confirm_values = numpy.array(features_confirm_values)
     features_full  = numpy.array(features_full)
     features_masks  = numpy.array(features_masks)
-    features_delex = numpy.array(features_delex)
+    #features_delex = numpy.array(features_delex)
     features_target = numpy.array(features_target)
     features_information_richness = numpy.array(features_information_richness)
+    features_sentenceGroup = numpy.array(features_sentenceGroup)
+
+    #these are used outside of the model
+    #features_offered = numpy.array(features_offered)
+    #features_requests = numpy.array(features_requests)
+    #features_goals = numpy.array(features_goals)
+
+    #prepare slot and value vectors for delex
+    slots = []
+    slot_vectors = numpy.zeros((len(dialogue_ontology), word_vector_size), dtype="float32")
+    value_vectors = {}
+    for slot_idx, slot in enumerate(dialogue_ontology.keys()):
+      slots.append(slot) 
+      slot_vectors[slot_idx, :] = word_vectors[slot]
+      value_vectors[slot] = numpy.zeros((len(dialogue_ontology[slot]), word_vector_size), dtype="float32")
+      for value_idx, value in enumerate(dialogue_ontology[slot]):
+        value_vectors[slot][value_idx, :] = word_vectors[value]
+
+    #if delex
+    if (1 == 0):
+        delex_model = Delex_Model(0.9)
+        #self.delex_model = Delex_Model(FLAGS.delex_threshold)
+        features_delex = []
+        #(B, M, d) --> (M, B, d)
+        for column_index, column_batch in enumerate(numpy.transpose(features_full, [1, 0, 2])):
+            #(B, d), (S, d) --> (B)  slot id or null
+            #delex_values = numpy.zeros((len(positive_indices), word_vector_size), dtype="float32")
+            delex_values = deepcopy(column_batch)
+    
+            best_slots, probs = delex_model.best(column_batch, slot_vectors)
+            for token_idx, token in enumerate(column_batch):
+              if best_slots[token_idx] < len(slots):
+                if slots[best_slots[token_idx]] != "request":
+                  tf.print ("slot replaced: ", column_index, token_idx, utterances_batch[token_idx][0][0].split()[column_index], 'WITH', list(dialogue_ontology.keys())[best_slots[token_idx]], "IN", utterances_batch[token_idx][0][0], "PROBS", probs[token_idx])
+                  delex_values[token_idx, :] = slot_vectors[best_slots[token_idx]]
+                
+            for slot_idx, slot in enumerate(dialogue_ontology.keys()):
+                best_values, probs = delex_model.best(column_batch, value_vectors[slot])
+                for token_idx, token in enumerate(column_batch):
+                  if best_values[token_idx] < len(dialogue_ontology[slot]):
+                    tf.print ("value replaced: ", column_index, token_idx, utterances_batch[token_idx][0][0].split()[column_index], 'WITH', dialogue_ontology[slot][best_values[token_idx]], "IN", utterances_batch[token_idx][0][0], "PROBS", probs[token_idx])
+                    delex_values[token_idx, :] = value_vectors[slot][best_values[token_idx]] 
+    
+            features_delex.append(delex_values)
+
+        features_delex = numpy.stack(features_delex, axis=1)
+        #tf.print ("DELEX: ",  features_delex)
+        #tf.print ("delex: ", features_delex.shape, numpy.array_equal(features_full, features_delex))
+    else:
+        features_delex = features_full
 
     return (features_full, features_masks, features_requested_slots, features_confirm_slots, \
-            features_confirm_values, features_delex, features_target, features_information_richness)
+            features_confirm_values, features_delex, features_target, features_information_richness, features_sentenceGroup, features_offered, features_requests, features_goals)
 
 
 def generate_examples_predict(target_slot, feature_vectors, word_vectors, dialogue_ontology,
@@ -1336,7 +1430,7 @@ def load_word_vectors(file_destination, primary_language="english"):
     return normalise_word_vectors(word_dictionary)
 
 
-def extract_feature_vectors(utterances, word_vectors, ngram_size=3, longest_utterance_length=40, use_asr=False, use_transcription_in_training=False):
+def extract_feature_vectors(utterances, word_vectors, ngram_size=3, longest_utterance_length=40, use_asr=False, use_transcription_in_training=False, num_actions=70):
     """
     This method returns feature vectors for all dialogue utterances. 
     It returns a tuple of lists, where each list consists of all feature vectors for ngrams of that length.
@@ -1365,6 +1459,19 @@ def extract_feature_vectors(utterances, word_vectors, ngram_size=3, longest_utte
 
     feature_targets = []
     feature_information_richness = []
+
+    stopw = set(stopwords.words('english'))
+    for w in ['!',',','.','?','</s>']:
+        stopw.add(w)
+
+    sentKeys = {}
+    feature_sentenceGroup = []
+
+    feature_offered = []
+    feature_requests = []
+    feature_goals = []
+
+    lemmatizer = WordNetLemmatizer()
 
     for idx, utterance in enumerate(utterances):
 
@@ -1456,7 +1563,7 @@ def extract_feature_vectors(utterances, word_vectors, ngram_size=3, longest_utte
                             
                         word_vectors[word] = xavier_vector(word)
                         
-                        #print("== Over Utterance: Generating random word vector for", word.encode('utf-8'), ":::", numpy.sum(word_vectors[word]))
+                        tf.print("== Over Utterance: Generating random word vector for", word.encode('utf-8'), ":::", numpy.sum(word_vectors[word]))
                         
                     try:
                         full_fv[word_idx * word_vector_size : (word_idx+1) * word_vector_size] = word_vectors[word] 
@@ -1467,12 +1574,6 @@ def extract_feature_vectors(utterances, word_vectors, ngram_size=3, longest_utte
 
             asr_weighted_feature_vectors.append(numpy.reshape(full_fv, (longest_utterance_length, word_vector_size)))
 
-        if max_asr_length == 0:
-            mask_fv = numpy.ones((longest_utterance_length), dtype="float32")
-        else:
-            mask_fv = numpy.concatenate((numpy.ones((max_asr_length), dtype="float32"), numpy.zeros((longest_utterance_length - max_asr_length), dtype="float32")), axis=0)
-        feature_masks.append(mask_fv)
-
         if len(asr_weighted_feature_vectors) != asr_count:
             print("££££££££££££££ Length of weighted vectors is:", len(asr_weighted_feature_vectors))    
 
@@ -1480,37 +1581,55 @@ def extract_feature_vectors(utterances, word_vectors, ngram_size=3, longest_utte
         # print len(asr_weighted_feature_vectors), asr_weighted_feature_vectors[0].shape
         ngram_feature_vectors[idx] = numpy.concatenate(asr_weighted_feature_vectors, axis=0)
 
-        #-------------TARGET------------------
-        #target will look like </s>wwwwwwwwwww</s><unk><unk><unk><unk><unk><unk><unk><unk><unk>.....
+        if max_asr_length == 0:
+            mask_fv = numpy.ones((longest_utterance_length), dtype="float32")
+        else:
+            mask_fv = numpy.concatenate((numpy.ones((max_asr_length), dtype="float32"), numpy.zeros((longest_utterance_length - max_asr_length), dtype="float32")), axis=0)
+        feature_masks.append(mask_fv)
+
+        #target will look like </s>word_ids_here</s><unk><unk><unk><unk><unk><unk><unk><unk><unk>..... total len is longest_utterance_length
         target = numpy.zeros((longest_utterance_length, ), dtype="int32")
-
         word_vectors_keys = list(word_vectors.keys())
-        #first is "</s>"
         target[0] = 1
-        word_idx = 1
-        #print (utterances[idx][6])
-        for word in utterances[idx][6].split():
-            if word_idx == longest_utterance_length - 1:
-              break
-            if word not in word_vectors:
-                #<unk> is at 0 position
-                target[word_idx] = 0
-            else:
-                target[word_idx] = word_vectors_keys.index(word)
-            word_idx += 1
-
-        #last is "</s>"
-        target[word_idx] = 1
-
-        #tf.print ("TARGET SHAPE: ", word_idx)
-
-        #    if len(words_utterance) > max_asr_length:
-        #        max_asr_length = len(words_utterance)    
+        for word_idx, word in enumerate(utterances[idx][6].split(), start=1):
+            target[word_idx] = word_vectors_keys.index(word)
+            if word_idx == longest_utterance_length - 2:
+                break
+        target[word_idx+1] = 1
 
         feature_targets.append(target)
-        #-------------TARGET------------------
 
         feature_information_richness.append(utterances[idx][7])
+
+        #target has to be delexed
+        #lemmanize key
+        key = tuple(set(sorted(lemmatizer.lemmatize(w) for w in utterances[idx][6] if w not in stopw)))
+
+        if key in sentKeys:
+            sentKeys[key][1] += 1
+            feature_sentenceGroup.append(sentKeys[key][0])
+        else:
+            sentKeys[key] = [len(sentKeys), 1]
+            feature_sentenceGroup.append(sentKeys[key][0])
+
+        feature_offered.append(utterances[idx][8])
+        feature_requests.append(utterances[idx][9])
+        feature_goals.append(utterances[idx][10])
+
+    mapping = {}
+    idx = 0
+    cnt = 0
+
+    #establish clustering for each utterance
+    for key, val in sorted(sentKeys.items(), key=lambda x:x[1][1],reverse=True):
+        mapping[val[0]] = idx
+        if idx<num_actions-1:cnt+=val[1]
+        idx+=1
+
+    print ("semi-supervised total keys/percentage: ", idx, float(cnt)/len(feature_sentenceGroup))
+
+    for idx, utterance in enumerate(utterances):
+        feature_sentenceGroup[idx] = min(mapping[feature_sentenceGroup[idx]], num_actions-1)
 
     list_of_features = []
 
@@ -1523,7 +1642,11 @@ def extract_feature_vectors(utterances, word_vectors, ngram_size=3, longest_utte
                                  confirm_slots[idx], 
                                  confirm_values[idx],
                                  feature_targets[idx],
-                                 feature_information_richness[idx]
+                                 feature_information_richness[idx],
+                                 feature_sentenceGroup[idx],
+                                 feature_offered[idx],
+                                 feature_requests[idx],
+                                 feature_goals[idx]
                                  ))
 
     return list_of_features
@@ -1955,7 +2078,7 @@ class NeuralBeliefTracker:
                 if " " not in value and value not in word_vectors:
 
                     word_vectors[str(value)] = xavier_vector(str(value))
-                    print("-- Generating word vector for:", value.encode("utf-8"), ":::", numpy.sum(word_vectors[value]))
+                    tf.print("-- Generating word vector for:", value.encode("utf-8"), ":::", numpy.sum(word_vectors[value]))
 
         # add up multi-word word values to get their representation:
         for slot in list(dialogue_ontology.keys()):

@@ -5,10 +5,18 @@
 #vocabulary size is 500 after preprocessing in LIDM opposite to 65k
 #need <<UKN>> token for all unknown to stabilize vocabulary size
 #delex should be in sample preprocessing
+#amount of information q is missing in NPA input
+#experimnet with onehot probabilities in all predictions - what are we maximizing
 #use LSTM for language model instead of GRU
-#how to hook NRN?
+#how to hook NRN? use x as in LIDM
+#q is missing as input into inference network
 #use biLSTM to generate d for input into inference network instead of biGRU
+#NLG - training includes restaurant recommendation - how "recommender" is injected?
 #target masks
+#target loss having </s>
+#samples from Pi , not from q
+#disconnected gradient
+#generated string, premature </s> 
 
 import sys
 
@@ -59,26 +67,22 @@ class Dense(tf.Module):
 #reshape required? see rensorflow matmul
     return y
 
-class Conv1d_layer(tf.Module):
-  def __init__(self, filter_width, in_channels, out_channels, padding='SAME', activation=None, stddev=1.0, name=''):
-    super(Conv1d_layer, self).__init__()
-    self.filter_width = filter_width
-    self.in_channels = in_channels
+class Conv_layer(tf.Module):
+  def __init__(self, filter_size, in_width, out_channels, padding='SAME', activation=tf.nn.relu, stddev=1.0, name=''):
+    super(Conv_layer, self).__init__()
+    self.filter_size = filter_size
+    self.in_width = in_width
     self.out_channels = out_channels
     self.padding = padding
     self.activation = activation
 
-    self.f = tf.Variable(tf.random.truncated_normal([self.filter_width, self.in_channels, self.out_channels], stddev=stddev), name=name + '_filter')
-    #self.f = tf.Variable(tf.ones([self.filter_width, self.in_channels, self.out_channels]), name=name + '_filter')
-    #self.b = tf.Variable(tf.zeros([self.out_channels]), name=name+'_b')
-    self.b = tf.Variable(tf.constant(0.1, shape=[self.out_channels]), name=name+'_b')
+    self.f = tf.Variable(tf.random.truncated_normal([self.filter_size, self.in_width, 1, self.out_channels], stddev=stddev), name=name + '_filter')
+    self.b = tf.constant(0.1, shape=[self.out_channels])
   def __call__(self, x):
-    conv = tf.nn.conv1d(x, self.f, [1], padding=self.padding, name="conv")
+    conv = tf.nn.conv2d(tf.expand_dims(x, -1), self.f, [1], padding=self.padding, name="conv")
     conv_bias = tf.nn.bias_add(conv, self.b, name='conv_bias')
 
-    if self.activation:
-      return self.activation(conv_bias, name='conv_bias_relu')
-    return conv_bias
+    return tf.math.reduce_max(self.activation(tf.squeeze(conv_bias, axis=2)), axis=1, keepdims=False)
 
 class GRU_Encoder(tf.Module):
   def __init__(self, hidden_size, sequence_length, batch_size, dropout=0.1, is_training=True):
@@ -267,6 +271,7 @@ class RequestSlot_Model(tf.Module):
   def __init__(self, sentense_size,
                      n_values,
                      word_vector_size,
+                     hidden_size,
                      activation_fn=tf.nn.relu,
                      dropout_prob=0.5,
                      initializer_range=1.0,
@@ -280,9 +285,9 @@ class RequestSlot_Model(tf.Module):
 
     self.n_values = n_values
 
-    self.conv_1n = Conv1d_layer(1, word_vector_size, word_vector_size, padding='VALID', stddev=0.1, activation=activation_fn)
-    self.conv_2n = Conv1d_layer(2, word_vector_size, word_vector_size, padding='VALID', stddev=0.1, activation=activation_fn)
-    self.conv_3n = Conv1d_layer(3, word_vector_size, word_vector_size, padding='VALID', stddev=0.1, activation=activation_fn)
+    self.conv_1n = Conv_layer(1, word_vector_size, word_vector_size, padding='VALID', stddev=0.1, activation=activation_fn, name="conv_1n")
+    self.conv_2n = Conv_layer(2, word_vector_size, word_vector_size, padding='VALID', stddev=0.1, activation=activation_fn, name="conv_2n")
+    self.conv_3n = Conv_layer(3, word_vector_size, word_vector_size, padding='VALID', stddev=0.1, activation=activation_fn, name="conv_3n")
 
     self.c_layer = Dense(word_vector_size,
                 word_vector_size,
@@ -291,17 +296,18 @@ class RequestSlot_Model(tf.Module):
                 name='c_layer')
 
     self.sem_layer_1 = Dense(word_vector_size,
-		100,
+		hidden_size,
 		activation=tf.nn.sigmoid,
 		stddev=initializer_range,
 		name='sem_layer_1')
 
-    self.sem_layer_2 = Dense(100,
+    self.sem_layer_2 = Dense(hidden_size,
 		1,
 		activation=None,
 		stddev=initializer_range,
 		name='sem_layer_2')
 
+  @tf.function
   def __call__(self, utterence_representation, sys_req, sys_conf_slots, sys_conf_values, utterance_representations_delex, batch_ys_prev, slot_vectors, slot_values):
 
     #(v, d) + (v, d)) --> (v, d)
@@ -312,13 +318,11 @@ class RequestSlot_Model(tf.Module):
     #tf.print ("utterence_representation", utterence_representation.shape)
 
     #(B, M, d) --> (B, d)
-    G = tf.math.reduce_max(self.conv_1n(utterence_representation), axis=1, keepdims=False)
-    G = G + tf.math.reduce_max(self.conv_2n(utterence_representation), axis=1, keepdims=False)
-    G = G + tf.math.reduce_max(self.conv_3n(utterence_representation), axis=1, keepdims=False)
+    u = self.conv_1n(utterence_representation) + self.conv_2n(utterence_representation) + self.conv_3n(utterence_representation)
 
     #semantic interaction using multiply
     #(B, d) * (v, d) --> (B, 1, d) * (1, v, d) --> (B, v, d)
-    semantic_interaction = tf.expand_dims(G, 1) * tf.expand_dims(candidates[:self.n_values, :], 0)
+    semantic_interaction = tf.expand_dims(u, 1) * tf.expand_dims(candidates[:self.n_values, :], 0)
 
     #applying semantic weight and sigmoid
     #(B,v,d) --> (B,v,h)
@@ -356,6 +360,7 @@ class NonRequestSlot_Model(tf.Module):
   def __init__(self, sentense_size,
                      n_values,
                      word_vector_size,
+                     hidden_size,
                      activation_fn=tf.nn.relu,
                      dropout_prob=0.5,
                      initializer_range=1.0,
@@ -369,9 +374,9 @@ class NonRequestSlot_Model(tf.Module):
 
     self.n_values = n_values
 
-    self.conv_1n = Conv1d_layer(1, word_vector_size, word_vector_size, padding='VALID', stddev=0.1, activation=activation_fn)
-    self.conv_2n = Conv1d_layer(2, word_vector_size, word_vector_size, padding='VALID', stddev=0.1, activation=activation_fn)
-    self.conv_3n = Conv1d_layer(3, word_vector_size, word_vector_size, padding='VALID', stddev=0.1, activation=activation_fn)
+    self.conv_1n = Conv_layer(1, word_vector_size, word_vector_size, padding='VALID', stddev=0.1, activation=activation_fn)
+    self.conv_2n = Conv_layer(2, word_vector_size, word_vector_size, padding='VALID', stddev=0.1, activation=activation_fn)
+    self.conv_3n = Conv_layer(3, word_vector_size, word_vector_size, padding='VALID', stddev=0.1, activation=activation_fn)
 
     self.c_layer = Dense(word_vector_size,
                 word_vector_size,
@@ -380,36 +385,36 @@ class NonRequestSlot_Model(tf.Module):
                 name='c_layer')
 
     self.sem_layer_1 = Dense(word_vector_size,
-		100,
+		hidden_size,
 		activation=tf.nn.sigmoid,
 		stddev=initializer_range,
 		name='sem_layer_1')
 
-    self.sem_layer_2 = Dense(100,
+    self.sem_layer_2 = Dense(hidden_size,
 		1,
 		activation=None,
 		stddev=initializer_range,
 		name='sem_layer_2')
 
     self.req_layer_1 = Dense(word_vector_size,
-		100,
+		hidden_size,
 		activation=tf.nn.sigmoid,
 		stddev=initializer_range,
 		name='req_layer_1')
 
-    self.req_layer_2 = Dense(100,
+    self.req_layer_2 = Dense(hidden_size,
 		n_values,
 		activation=None,
 		stddev=initializer_range,
 		name='req_layer_2')
 
     self.conf_layer_1 = Dense(word_vector_size,
-		100,
+		hidden_size,
 		activation=tf.nn.sigmoid,
 		stddev=initializer_range,
 		name='conf_layer_1')
 
-    self.conf_layer_2 = Dense(100,
+    self.conf_layer_2 = Dense(hidden_size,
 		1,
 		activation=None,
 		stddev=initializer_range,
@@ -420,6 +425,7 @@ class NonRequestSlot_Model(tf.Module):
     self.W1_current = tf.Variable(tf.random.truncated_normal([n_values+1, n_values+1]), name='W1_current')
     self.W2_current = tf.Variable(tf.random.truncated_normal([n_values+1, n_values+1]), name='W2_current')
 
+  @tf.function
   def __call__(self, utterence_representation, sys_req, sys_conf_slots, sys_conf_values, utterance_representations_delex, batch_ys_prev, slot_vectors, slot_values):
 
     #(v, d) + (v, d)) --> (v, d)
@@ -430,13 +436,11 @@ class NonRequestSlot_Model(tf.Module):
     #tf.print ("utterence_representation", utterence_representation.shape)
 
     #(B, M, d) --> (B, d)
-    G = tf.math.reduce_max(self.conv_1n(utterence_representation), axis=1, keepdims=False)
-    G = G + tf.math.reduce_max(self.conv_2n(utterence_representation), axis=1, keepdims=False)
-    G = G + tf.math.reduce_max(self.conv_3n(utterence_representation), axis=1, keepdims=False)
+    u = self.conv_1n(utterence_representation) + self.conv_2n(utterence_representation) + self.conv_3n(utterence_representation)
 
     #semantic interaction using multiply
     #(B, d) * (v, d) --> (B, 1, d) * (1, v, d) --> (B, v, d)
-    semantic_interaction = tf.expand_dims(G, 1) * tf.expand_dims(candidates[:self.n_values, :], 0)
+    semantic_interaction = tf.expand_dims(u, 1) * tf.expand_dims(candidates[:self.n_values, :], 0)
 
     #applying semantic weight and sigmoid
     #(B,v,d) --> (B,v,h)
@@ -451,17 +455,17 @@ class NonRequestSlot_Model(tf.Module):
 
     #context request interation
 
-    #see if current processing slot is in system request using multiply
+    #see if current processing slot is in system request using multiply - specific slot is being processed [food, area, price range]
     #(B, d) * (1, d) --> (B, d)
     product_sysreq = sys_req * tf.expand_dims(slot_vectors[0, :], 0)
     #(B, d) --> (B)
     product_sysreq = tf.reduce_mean(product_sysreq, 1)
     
-    #request interaction with utterence
+    #request interaction with utterence - see if user response has that slot: "what rice range" --> "i don't care"
     #(B, 1) * (B, d) --> (B, d)
-    request_decision = tf.expand_dims(product_sysreq, 1) * G
+    request_decision = tf.expand_dims(product_sysreq, 1) * u
 
-    #applying request weight and sigmoid
+    #applying request weight and sigmoid: here slot : prive range, value : don't care; otherwise it's not clear what is "I don't care" 
     #(B,d) --> (B,h)
     req_output = self.req_layer_1(request_decision)
     req_output = dropout(req_output, self.dropout_prob)
@@ -472,6 +476,7 @@ class NonRequestSlot_Model(tf.Module):
     
     #context confirmation interation
     
+    #system: "Is it OK on the north side of the town?" --> user: "Yes"
     #mean((B, d) * (1, d)) --> (B)
     product_conf_slot = tf.reduce_mean(sys_conf_slots * tf.expand_dims(slot_vectors[0, :], 0), 1)
     #mean((B, 1, d) * (1, v, d)) --> (B, V)
@@ -480,14 +485,14 @@ class NonRequestSlot_Model(tf.Module):
     product_conf = tf.expand_dims(product_conf_slot, -1) * product_conf_values
 
     full_ones = tf.ones(tf.shape(product_conf))
-    #(B, V) --> (B, V)
+    #(B, v) --> (B, v)
     product_conf_ones = tf.cast(tf.equal(product_conf, full_ones), "float32")
 
-    #conf interaction with utterence
+    #conf interaction with utterence: this is an iteraction of slot/value with "Yes"
     #(B, v, 1) * (B, 1, d) --> (B, v, d)
-    conf_decision = tf.expand_dims(product_conf_ones, -1) * tf.expand_dims(G, 1)
+    conf_decision = tf.expand_dims(product_conf_ones, -1) * tf.expand_dims(u, 1)
 
-    #applying conf weight and sigmoid
+    #applying conf weight and sigmoid: here we identify value: "north"
     #(B,v,d) --> (B,v,h)
     conf_output = self.conf_layer_1(conf_decision)
     conf_output = dropout(conf_output, self.dropout_prob)
@@ -515,6 +520,7 @@ class NonRequestSlot_Model(tf.Module):
     #y_presoftmax = y_presoftmax + utterance_representations_delex
 
     #(B, v), (v, v)--> (B, v)
+    # just combining previous believe state & current value
     b1 = tf.matmul(batch_ys_prev, self.W1_past) + tf.matmul(y_presoftmax, self.W1_current)
     b2 = tf.matmul(batch_ys_prev, self.W2_past) + tf.matmul(y_presoftmax, self.W2_current)
     b12 = tf.concat([tf.expand_dims(b1, -1), tf.expand_dims(b2, -1)], -1)
@@ -540,7 +546,7 @@ class Delex_Model(tf.Module):
 
     self.delex_threshold=delex_threshold
 
-  def best_slots(self, utterence_representation, sys_req, sys_conf_slots, sys_conf_values, utterance_representations_delex, slot_vectors):
+  def best(self, utterence_representation, slot_vectors):
 
     #(B, d) . (S, d) --> (B, d) . (d, S) --> (B, S)
     product_slot = tf.nn.sigmoid(tf.matmul(utterence_representation, slot_vectors, transpose_b=True))
@@ -548,17 +554,13 @@ class Delex_Model(tf.Module):
     slot_indices = tf.argmax(product_slot, -1, output_type=tf.dtypes.int32)
     slot_probs = tf.gather(product_slot, slot_indices, batch_dims=1, axis=-1)
 
-    return tf.maximum(slot_indices, tf.cast(tf.cast(tf.less(slot_probs, self.delex_threshold), 'float32') * slot_vectors.shape[0], 'int32'))
+    #tf.print (slot_probs, summarize=-1)
+    #tf.print (utterence_representation[0])
+    #tf.print (slot_vectors[0])
+    #tf.print (product_slot, summarize=-1)
+    #sys.exit(0)
 
-  def best_values(self, utterence_representation, sys_req, sys_conf_slots, sys_conf_values, utterance_representations_delex, value_vectors):
-
-    #(1, d) . (d, v) --> (1, v)
-    product_value = tf.nn.sigmoid(tf.matmul(tf.expand_dims(utterence_representation, 0), value_vectors, transpose_b=True))
-            
-    value_indices = tf.argmax(product_value, -1, output_type=tf.dtypes.int32)
-    value_probs = tf.gather(product_value, value_indices, batch_dims=1, axis=-1)
-
-    return tf.squeeze(tf.maximum(value_indices, tf.cast(tf.cast(tf.less(value_probs, self.delex_threshold), 'float32') * value_vectors.shape[0], 'int32')))
+    return tf.maximum(slot_indices, tf.cast(tf.cast(tf.less(slot_probs, self.delex_threshold), 'float32') * slot_vectors.shape[0], 'int32')), slot_probs
 
 class NIE_Model(tf.Module):
   #   B = batch size (number of sequences)
@@ -570,7 +572,10 @@ class NIE_Model(tf.Module):
   #   v = values in slot
   #   a - num dialog actions
   #   V - vocabulary size
-  def __init__(self, batch_size,
+  def __init__(self, 
+                batch_size,
+                num_pairs,
+                num_slots,
 		hidden_size,
 		sentense_length,
 		dropout_prob=0.1,
@@ -581,20 +586,35 @@ class NIE_Model(tf.Module):
     if is_training == False:
       dropout_prob = 0.0   
 
-    self.dropout_prob = dropout_prob
-
     self.encoder_layer = biGRU_Encoder(
       hidden_size,
       sentense_length,
       batch_size,
-      dropout=self.dropout_prob,
+      dropout=dropout_prob,
       is_training=is_training)
 
-  def __call__(self, input, masks):
+    self.Wq = tf.Variable(tf.random.truncated_normal([num_slots, hidden_size]), name='Wq')
+    self.Wb = tf.Variable(tf.random.truncated_normal([num_pairs, hidden_size]), name='Wb')
+    self.Wz = tf.Variable(tf.random.truncated_normal([2*hidden_size, hidden_size]), name='Wz')
+
+  def __call__(self, input, masks, batch_information_richness, bt):
     #(b, M, d) --> (b, 2h)
     _, _, forward_state, backward_state = self.encoder_layer(input, masks)
 
-    return tf.concat([forward_state, backward_state], axis=-1)
+    zt = tf.concat([forward_state, backward_state], axis=-1)
+
+    #V - value count for all inform values (request as well?)
+    #(b, p), (b, 2h) --> (b, p+2h)
+    #s = q concat bt concat zt
+    #s = tf.concat([bt, zt], axis=1)
+    #ACTUALLY DOT EACH INTO RIGHT VECTOR SIZE AND SUM-UP OPPOSITE TO CONCAT
+    #(b, p), (b, 2h) --> (b, h), (b, h) --> (b, h)
+    #tf.print (batch_information_richness.shape)
+    s = tf.matmul(tf.cast(batch_information_richness, tf.float32), self.Wq)+tf.matmul(bt, self.Wb)+tf.matmul(zt, self.Wz)
+
+    #tf.print ("S state: ", s.shape)
+
+    return s, zt
 
 class NPA_Model(tf.Module):
   #   B = batch size (number of sequences)
@@ -634,23 +654,17 @@ class NPA_Model(tf.Module):
                 stddev=initializer_range,
                 name='layer_2')
   
-  def __call__(self, input):
+  def __call__(self, s):
     #(b, h) --> (b, a)
-    action_distribution = self.layer_2(self.layer_1(input))
+    action_distribution = self.layer_2(self.layer_1(s))
 
     #(b, a) --> (b)
     sampled_action = tf.squeeze(tf.random.categorical(tf.math.log(action_distribution + epsilon), 1))
 
     #(b) --> (b, a)
-    #action_mask = tf.cast(tf.one_hot(sampled_action, self.num_actions), 'bool')
-    action_mask = tf.one_hot(sampled_action, self.num_actions)
+    #action_onehot = tf.one_hot(sampled_action, self.num_actions)
 
-    #(b, a), (b, a) --> (b)
-    action_prob_onehot = action_distribution * action_mask
-    action_prob = tf.reduce_sum(action_prob_onehot, axis=-1)
-    #action_prob = tf.squeeze(tf.ragged.boolean_mask(action_distribution, action_mask), axis=-1)
-
-    return action_distribution, action_prob_onehot, action_prob
+    return action_distribution, sampled_action
 
 class NLG_GRU_Model(tf.Module):
   #   B = batch size (number of sequences)
@@ -683,14 +697,11 @@ class NLG_GRU_Model(tf.Module):
     self.group_normalization_1 = tfa.layers.GroupNormalization(groups=1, axis=-1)
 
     self.Wgate = tf.Variable(tf.random.truncated_normal([num_actions, hidden_size]), name='Wgate')
-    self.gate_layer = Dense(hidden_size,
-                hidden_size,
-                activation=tf.nn.sigmoid,
-                stddev=initializer_range,
-                name='gate_layer')
+    self.Bgate = tf.Variable(tf.zeros([hidden_size]), name='Bgate')
 
+    #this is like an embedding of an action; action is onehot so it picks corresponding embedding
     self.W5 = tf.Variable(tf.random.truncated_normal([num_actions, hidden_size]), name='W5')
-
+ 
     self.initial_state = tf.zeros([batch_size, hidden_size], dtype=tf.float32, name='state')
     
     self.Woh = tf.Variable(tf.random.truncated_normal([2*hidden_size, hidden_size]), name='Woh')
@@ -708,13 +719,13 @@ class NLG_GRU_Model(tf.Module):
     #ACTION - THIS MUST BE EMBEDDED
     #(b, a), (b, a) * (b, p+2h).(p+2h, a) --> (b, a), (b, a) --> (b, 2a) 
 
-    gate = self.gate_layer(tf.matmul(a, self.Wgate))
+    gate = tf.nn.sigmoid(tf.matmul(a, self.Wgate)+self.Bgate)
 
-    #gate is sigmoid folters s which is tanh. all of it contat with tanh of emb of a
-    ot = tf.concat([tf.math.tanh(tf.matmul(a, self.W5)), gate * s], axis=-1)
+    #concat of action and gated state
+    ot = tf.concat([tf.math.tanh(tf.matmul(a, self.W5)), gate * tf.math.tanh(s)], axis=-1)
 
     #(b, 2h) --> (b, h)
-    #this is tanh of matmul of ot
+    #get back to h
     ot_h = tf.math.tanh(tf.matmul(ot, self.Woh))
 
     #(b, M-1), (b, M-1), (b, h) --> (b, M-1), (b, M-1)
@@ -739,6 +750,8 @@ class P_Model(tf.Module):
   #   a - num dialog actions
   #   V - vocabulary size
   def __init__(self, 
+                dkl_lambda,
+                eta,
                 nie_model,
                 npa_model,
                 nlg_model,
@@ -757,6 +770,21 @@ class P_Model(tf.Module):
     if is_training == False:
       dropout_prob = 0.0   
 
+    self.q_model = Q_Model(
+      dkl_lambda,
+      batch_size,
+      num_pairs=num_pairs,
+      num_slots=num_slots,
+      num_actions=num_actions,
+      hidden_size=hidden_size,
+      sentense_length=sentense_length,
+      vocabulary_size=vocabulary_size,
+      dropout_prob=dropout_prob,
+      initializer_range=initializer_range,
+      is_training=is_training)
+
+    self.dkl_lambda = dkl_lambda
+    self.eta = eta
     self.nie_model = nie_model
     self.npa_model = npa_model
     self.nlg_model = nlg_model
@@ -767,41 +795,113 @@ class P_Model(tf.Module):
     self.hidden_size = hidden_size
     self.sentense_length = sentense_length
 
-    self.Wq = tf.Variable(tf.random.truncated_normal([num_slots, hidden_size]), name='Wq')
-    self.Wb = tf.Variable(tf.random.truncated_normal([num_pairs, hidden_size]), name='Wb')
-    self.Wz = tf.Variable(tf.random.truncated_normal([2*hidden_size, hidden_size]), name='Wz')
+    self.br = tf.Variable(0., name='br')
 
-  def __call__(self, delex_batch, batch_masks, batch_target, batch_information_richness, bt):
+  @tf.function
+  def __call__(self, delex_batch, batch_masks, batch_target, batch_information_richness, batch_sentenceGroup, bt):
 
     #(b, M, d), (b, M) --> (b, 2h)
-    zt = self.nie_model(delex_batch, batch_masks)
-  
-    tf.print ("NIE: ", zt.shape)
-  
-    #V - value count for all inform values (request as well?)
-    #(b, p), (b, 2h) --> (b, p+2h)
-    #s = q concat bt concat zt
-    #s = tf.concat([bt, zt], axis=1)
-    #ACTUALLY DOT EACH INTO RIGHT VECTOR SIZE AND SUM-UP OPPOSITE TO CONCAT
-    #(b, p), (b, 2h) --> (b, h), (b, h) --> (b, h)
-    #tf.print (batch_information_richness)
-    s = tf.nn.tanh(tf.matmul(tf.cast(batch_information_richness, tf.float32), self.Wq)+tf.matmul(bt, self.Wb)+tf.matmul(zt, self.Wz))
+    s, zt = self.nie_model(delex_batch, batch_masks, batch_information_richness, bt)
 
-    tf.print ("S state: ", s.shape)
+    #tf.print ("NIE: ", zt.shape)
 
-    #(b, 2p) --> (b, a), (b, a), (b)
-    #(b, h) --> (b, a), (b, a), (b)
-    action_distribution, action_prob_onehot, action_prob = self.npa_model(s)
+    #(b, h) --> (b, a), (b, a)
+    action_distribution, sampled_action = self.npa_model(s)
   
-    tf.print ("NPA: ", action_distribution.shape, action_prob.shape)
+    #tf.print ("NPA: ", action_distribution.shape, sampled_action.shape)
   
-    #(b, 2p), (b, a) --> (b, M), (b, M), (b, M, d)
+    #########
+    #ACTON: CLUSTER or SAMPLE
+
+    batch_sentenceGroup = tf.minimum(batch_sentenceGroup, self.num_actions-1)
+    clustered = (batch_sentenceGroup < self.num_actions-1)
+
+    action_onehot = tf.one_hot(batch_sentenceGroup * tf.cast(clustered, dtype=tf.int64) + sampled_action * tf.cast(tf.math.logical_not(clustered), dtype=tf.int64), self.num_actions)
+
+    #########
+
     #(b, h), (b, a) --> (b, M), (b, M), (b, M, d)
-    Dt_loss, Dt_index, Dt = self.nlg_model(s, action_prob_onehot, batch_target[:, :-1], batch_target[:, 1:])
+    Dt_loss, Dt_index, Dt = self.nlg_model(s, action_onehot, batch_target[:, :-1], batch_target[:, 1:])
 
-    tf.print ("NLG: ", Dt.shape, Dt_index.shape, Dt_loss.shape)
+    #tf.print ("NLG: ", Dt.shape, Dt_index.shape, Dt_loss.shape)
 
-    return zt, Dt, Dt_index, Dt_loss, action_distribution, action_prob 
+    #########
+
+    q_distribution, q_prob = self.q_model(bt, batch_information_richness, zt, Dt)
+
+    #########
+
+    Q = tf.stop_gradient(q_distribution)
+
+    #(b, M) --> (b)
+    per_example_p_loss = -tf.reduce_sum(tf.math.log(Dt_loss + epsilon), axis=-1)
+    #((b, a) * ((b, a) - log(b, a))) --> (b)
+
+    ##################
+          
+    per_example_KL_loss = -tf.math.log(tf.reduce_sum(action_distribution * action_onehot, axis=-1) + epsilon) * tf.cast(clustered, dtype=tf.float32) + self.dkl_lambda*tf.reduce_sum(Q*(tf.math.log(Q + epsilon) - tf.math.log(action_distribution + epsilon)), axis=-1) * tf.cast(tf.math.logical_not(clustered), dtype=tf.float32)
+
+    ##################
+  
+    total_p_loss = tf.reduce_mean(per_example_p_loss)
+    total_KL_loss = tf.reduce_mean(per_example_KL_loss)
+  
+    #tf.print ("Dt_loss, q: ", Dt_loss.shape, q_prob.shape)
+
+    #(b, M), (b, a) --> (b) , (b) --> (b)
+    r = tf.stop_gradient(tf.reduce_sum(tf.math.log(Dt_loss + epsilon), axis=-1) - tf.reduce_sum(self.dkl_lambda*(q_distribution*(tf.math.log(q_distribution + epsilon) - tf.math.log(action_distribution + epsilon))), axis=-1))
+
+    reward = tf.stop_gradient(r - self.br)
+    base = self.br
+
+    #(b), (b, a) --> (b), (b) --> (b)
+
+    ##################
+          
+    per_example_q_loss = -tf.math.log(tf.reduce_sum(q_distribution * action_onehot, axis=-1) + epsilon) * tf.cast(clustered, dtype=tf.float32) + -self.eta*reward*tf.math.log(q_prob + epsilon) * tf.cast(tf.math.logical_not(clustered), dtype=tf.float32)
+
+    ##################
+  
+    total_q_loss = tf.reduce_mean(per_example_q_loss)
+
+    ##################
+          
+    per_example_base_loss = tf.reduce_mean(tf.square(r - base))* tf.cast(tf.math.logical_not(clustered), dtype=tf.float32)
+
+    ##################
+    total_base_loss = tf.reduce_mean(per_example_base_loss)
+
+    return total_p_loss, total_KL_loss, total_q_loss, total_base_loss, Dt_index, r, tf.math.log(q_prob + epsilon), reward
+
+  @tf.function
+  def rl(self, delex_batch, batch_masks, batch_target, batch_information_richness, batch_sentenceGroup, bt):
+
+    #(b, M, d), (b, M) --> (b, 2h)
+    s, zt = self.nie_model(delex_batch, batch_masks, batch_information_richness, bt)
+  
+    #tf.print ("NIE: ", zt.shape)
+
+    #(b, h) --> (b, a), (b, a)
+    action_distribution, sampled_action = self.npa_model(s)
+  
+    #tf.print ("NPA: ", action_distribution.shape, sampled_action.shape)
+  
+    #########
+    #ACTON: NPA OR CLUSTER 
+
+    batch_sentenceGroup = tf.minimum(batch_sentenceGroup, self.num_actions-1)
+    clustered = (batch_sentenceGroup < self.num_actions-1)
+
+    action_onehot = tf.one_hot(batch_sentenceGroup * tf.cast(clustered, dtype=tf.int64) + sampled_action * tf.cast(tf.math.logical_not(clustered), dtype=tf.int64), self.num_actions)
+
+    #########
+
+    #(b, h), (b, a) --> (b, M), (b, M), (b, M, d)
+    Dt_loss, Dt_index, Dt = self.nlg_model(s, action_onehot, batch_target[:, :-1], batch_target[:, 1:])
+
+    #tf.print ("NLG: ", Dt.shape, Dt_index.shape, Dt_loss.shape)
+
+    return tf.math.log(tf.reduce_sum(action_distribution * action_onehot, axis=-1) + epsilon), Dt_index
 
 class Q_Model(tf.Module):
   #   B = batch size (number of sequences)
@@ -852,7 +952,6 @@ class Q_Model(tf.Module):
     self.Wd = tf.Variable(tf.random.truncated_normal([hidden_size*2, hidden_size]), name='Wd')
     self.beta_y = tf.Variable(tf.zeros([hidden_size]), name='beta_y')
     self.We = tf.Variable(tf.random.truncated_normal([hidden_size, num_actions]), name='We')
-    self.br = tf.Variable(0., name='br')
 
     self.masks = tf.constant(tf.ones((self.batch_size, self.sentense_length), dtype=tf.float32, name='masks'))
 
@@ -860,26 +959,26 @@ class Q_Model(tf.Module):
 
     #Variational Inference Network (used for training only)
 
-    #(b, M, d), (b, M) -->(b, d), (b, d)
+    #(b, M, d), (b, M) -->(b, h), (b, h)
     _, _, forward_state, backward_state = self.d_maker(D, self.masks)
 
     dt = tf.concat([forward_state, backward_state], axis=-1)
 
-    tf.print ("bt, qt, zt, dt: ", bt.shape, batch_information_richness.shape, zt.shape, dt.shape)
-    #(b, p), (b, s), (b, 2h), (b, 2h), (h) --> (b, h), (b, h), (b, h), (b, h), (h) --> (b, h)
+    #tf.print ("bt, qt, zt, dt: ", bt.shape, batch_information_richness.shape, zt.shape, dt.shape)
+    #(b, p), (b, s), (b, 2h), (b, 2h), (w) --> (b, h), (b, h), (b, h), (b, h), (h) --> (b, h)
     e_all = tf.nn.sigmoid(tf.matmul(bt, self.Wb) + tf.matmul(tf.cast(batch_information_richness, tf.float32), self.Wq) + tf.matmul(zt, self.Wz) + tf.matmul(dt, self.Wd) + self.beta_y)
 
     #(b, h) . (h, a) --> (b, a)
     q_distribution = tf.nn.softmax(tf.matmul(e_all, self.We))
 
     #(b, a) --> (b)
-    sampled_q = tf.squeeze(tf.random.categorical(tf.math.log(q_distribution + epsilon), 1))
+    q_sample = tf.squeeze(tf.random.categorical(tf.math.log(q_distribution + epsilon), 1))
 
     #(b) --> (b, a)
-    q_mask = tf.one_hot(sampled_q, self.num_actions)
+    q_onehot = tf.one_hot(q_sample, self.num_actions)
     #tf.print (sampled_q, summarize=-1)
     #(b, a), (b, a) --> (b, a)
-    q_prob_onehot = q_distribution * q_mask
+    q_prob_onehot = q_distribution * q_onehot
     q_prob = tf.reduce_sum(q_prob_onehot, axis=-1)
 
-    return q_distribution, q_prob_onehot, q_prob, self.br
+    return q_distribution, q_prob
